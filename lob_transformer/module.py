@@ -1,5 +1,5 @@
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,7 @@ class LOBDataset(Dataset):
         # For classification, ensure target is 1D and convert to long tensor
         if len(target_cols) == 1:
             target_array = target_array.flatten()  # Convert to 1D
-        self.target_data = torch.tensor(target_array, dtype=torch.long)  # Use long for classification
+        self.target_data = self._data_to_tensors(target_array, dtype=torch.long)  # Use long for classification
         
         self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)])
         self.data = self._preprocess_data(self.data)
@@ -97,8 +97,11 @@ class LOBDataset(Dataset):
         return df
     
     
-    def _data_to_tensors(self, arr: np.array) -> torch.Tensor:
-        return torch.tensor(arr, dtype=torch.float32)
+    def _data_to_tensors(self, arr: np.array, **kwargs) -> torch.Tensor:
+        return torch.tensor(arr, **{
+            'dtype': torch.float32,
+            **kwargs
+        })
     
     
     def to_dataloader(self, num_workers=4, pin_memory=True, **kwargs) -> DataLoader:
