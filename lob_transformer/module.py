@@ -321,11 +321,11 @@ def main():
     from lightning.pytorch import Trainer
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     
+    model_path = os.getenv('MODEL_PATH', 'models')
     supabase_url = os.getenv('SUPABASE_URL')
     supabase_key = os.getenv('SUPABASE_KEY')
     supabase_table = os.getenv('SUPABASE_TABLE_FOR_TRAIN_TRANSFORMER')
     
-    model_path = 'models'
     max_epochs = 100
     batch_size = 32
     window_size = 60
