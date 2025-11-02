@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import numpy as np
 import pandas as pd
 
@@ -5,288 +8,213 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset
-import math
+from torch.utils.data import Dataset, DataLoader
 
 from lightning.pytorch import LightningModule
 
 
-CHANNELS = 4
-DEPTH_SIZE = 10
-
-
 class LOBDataset(Dataset):
     def __init__(self,
-                 data: pd.DataFrame,
+                 df: pd.DataFrame,
                  window_size: int = 100,
-                 normalize: bool = True):
-        self.data = data
+                 target_cols: list = ['target'],
+                 depth: int = 10):
+        super().__init__()
+        
+        self.data = df.copy()
         self.window_size = window_size
-        self.normalize = normalize
+        self.target_cols = target_cols
+        self.depth = depth
         
-        if self.normalize:
-            self.normalized_data = self._apply_zscore_normalization(data)
-        else:
-            self.normalized_data = data
+        self._validate_data(self.data)
+        
+        self.target_data = self._target_normalization(self.data[target_cols])
+        target_array = self.target_data[:-min(len(self.target_data), self.window_size)].to_numpy()
+        
+        # For classification, ensure target is 1D and convert to long tensor
+        if len(target_cols) == 1:
+            target_array = target_array.flatten()  # Convert to 1D
+        self.target_data = torch.tensor(target_array, dtype=torch.long)  # Use long for classification
+        
+        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)])
+        self.data = self._preprocess_data(self.data)
+        self.data = self._data_to_tensors(self.data) # shape: (num_samples, 2, depth*2, window_size)
     
-    def _apply_zscore_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
-        normalized_df = df.copy()
-        
-        price_size_columns = []
-        for depth_level in range(1, DEPTH_SIZE + 1):
-            price_size_columns.extend([
-                f'bid_price_{depth_level}',
-                f'ask_price_{depth_level}',
-                f'bid_size_{depth_level}',
-                f'ask_size_{depth_level}'
-            ])
-        
-        existing_columns = [col for col in price_size_columns if col in df.columns]
-        
-        for col in existing_columns:
-            normalized_df[col] = pd.to_numeric(normalized_df[col], errors='coerce')
+    
+    def _validate_data(self, df: pd.DataFrame):
+        price_cols = [f'bid_price_{i+1}' for i in range(self.depth)] + [f'ask_price_{i+1}' for i in range(self.depth)]
+        size_cols = [f'bid_size_{i+1}' for i in range(self.depth)] + [f'ask_size_{i+1}' for i in range(self.depth)]
+        required_columns = self.target_cols + price_cols + size_cols
+        for col in required_columns:
+            if col not in df.columns:
+                raise ValueError(f"Missing required column: {col}")
+    
+    
+    def _preprocess_data(self, df: pd.DataFrame) -> np.array:
+        snapshots = []
+        for i in range(len(df)):
+            bids = np.stack([
+                df.iloc[i][[f'bid_price_{j+1}' for j in range(self.depth)]].to_numpy(),
+                df.iloc[i][[f'bid_size_{j+1}' for j in range(self.depth)]].to_numpy(),
+            ], axis=0) # shape: (2, depth)
+            asks = np.stack([
+                df.iloc[i][[f'ask_price_{j+1}' for j in range(self.depth)]].to_numpy(),
+                df.iloc[i][[f'ask_size_{j+1}' for j in range(self.depth)]].to_numpy(),
+            ], axis=0) # shape: (2, depth)
             
-            expanding_mean = normalized_df[col].expanding(min_periods=10).mean()
-            expanding_std = normalized_df[col].expanding(min_periods=10).std()
-            
-            expanding_std = expanding_std.fillna(1.0)
-            expanding_std = expanding_std.replace(0.0, 1.0)
-            
-            normalized_df[col] = (normalized_df[col] - expanding_mean) / expanding_std
-            normalized_df[col] = normalized_df[col].fillna(0.0)
+            snapshot = np.concatenate([bids, asks], axis=1) # shape: (2, depth*2)
+            snapshots.append(snapshot)
         
-        return normalized_df
+        snapshots = np.stack(snapshots, axis=0) # shape: (num_samples, 2, depth*2)
+        
+        samples = []
+        for i in range(len(snapshots) - self.window_size + 1):
+            window = snapshots[i:i + self.window_size] # shape: (window_size, 2, depth*2)
+            window = np.transpose(window, (1, 2, 0)) # shape: (2, depth*2, window_size)
+            samples.append(window)
+        
+        return np.stack(samples).astype(np.float32) # shape: (num_samples, 2, depth*2, window_size)
+    
+    
+    def _target_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+    
+    
+    def _apply_zscore_normalization(self, df: pd.DataFrame, window: int = 60) -> pd.DataFrame:
+        def rolling_zscore_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+            mean = df.rolling(window=window, min_periods=1).mean()
+            std = df.rolling(window=window, min_periods=1).std()
+            zscore = (df - mean) / std.replace(0, 1)
+            zscore = zscore.fillna(0.0)
+            return zscore.astype(np.float32)
+        
+        price_cols = [f'bid_price_{i+1}' for i in range(self.depth)] + [f'ask_price_{i+1}' for i in range(self.depth)]
+        size_cols = [f'bid_size_{i+1}' for i in range(self.depth)] + [f'ask_size_{i+1}' for i in range(self.depth)]
+        
+        df[price_cols] = rolling_zscore_dataframe(df[price_cols])
+        df[size_cols] = rolling_zscore_dataframe(df[size_cols])
+        
+        return df
+    
+    
+    def _data_to_tensors(self, arr: np.array) -> torch.Tensor:
+        return torch.tensor(arr, dtype=torch.float32)
+    
+    
+    def to_dataloader(self, num_workers=4, pin_memory=True, **kwargs) -> DataLoader:
+        return DataLoader(self, num_workers=num_workers, pin_memory=pin_memory, **kwargs)
+    
     
     def __len__(self):
         return max(0, len(self.data) - self.window_size + 1)
     
-    def __getitem__(self, idx):
-        normalized_window_data = self.normalized_data.iloc[idx:idx + self.window_size, :]
-        window_data = self.data.iloc[idx:idx + self.window_size, :]
+    
+    def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.data[idx]
+        y = self.target_data[idx]
         
-        item = np.zeros((CHANNELS, DEPTH_SIZE, self.window_size), dtype=np.float32)
-        target = int(window_data['target'].iloc[-1] if pd.notna(window_data['target'].iloc[-1]) else 1)
-        
-        for t in range(self.window_size):
-            if t < len(normalized_window_data):
-                row = normalized_window_data.iloc[t]
-                
-                for depth_level in range(1, DEPTH_SIZE + 1):
-                    bid_price_col = f'bid_price_{depth_level}'
-                    ask_price_col = f'ask_price_{depth_level}'
-                    bid_size_col = f'bid_size_{depth_level}'
-                    ask_size_col = f'ask_size_{depth_level}'
-                    
-                    if bid_price_col in row and pd.notna(row[bid_price_col]):
-                        item[0, depth_level-1, t] = float(row[bid_price_col])
-                    if ask_price_col in row and pd.notna(row[ask_price_col]):
-                        item[1, depth_level-1, t] = float(row[ask_price_col])
-                    if bid_size_col in row and pd.notna(row[bid_size_col]):
-                        item[2, depth_level-1, t] = float(row[bid_size_col])
-                    if ask_size_col in row and pd.notna(row[ask_size_col]):
-                        item[3, depth_level-1, t] = float(row[ask_size_col])
-
-        return (
-            torch.tensor(item, dtype=torch.float32),
-            torch.tensor(target, dtype=torch.long)
-        )
+        return x, y
 
 
 class StructuredPatchEmbedding(nn.Module):
     def __init__(self, 
                  input_channels: int = 2,
-                 patch_height: int = 5,
-                 patch_width: int = 10,
-                 embed_dim: int = 256):
+                 patch_size: tuple = (5, 12),
+                 embed_dim: int = 128):
         super().__init__()
         self.input_channels = input_channels
-        self.patch_height = patch_height
-        self.patch_width = patch_width
+        self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
-        self.patch_size = input_channels * patch_height * patch_width
-        self.projection = nn.Linear(self.patch_size, embed_dim)
+        self.projection = nn.Linear(input_channels * patch_size[0] * patch_size[1], embed_dim)
         self.position_embedding = nn.Parameter(torch.randn(1, 1000, embed_dim))
         
     def forward(self, x):
-        batch_size, channels, depth, window = x.shape
+        batch_size, channels, height, window = x.shape
+        patch_height, patch_width = self.patch_size
         
-        price_data = torch.cat([x[:, 0:1, :, :], x[:, 1:2, :, :]], dim=1)
-        size_data = torch.cat([x[:, 2:3, :, :], x[:, 3:4, :, :]], dim=1)
-        combined_data = torch.cat([price_data, size_data], dim=1)
-        
-        patches = []
-        num_patches_h = depth // self.patch_height
-        num_patches_w = window // self.patch_width
-        
-        for i in range(num_patches_h):
-            for j in range(num_patches_w):
-                h_start, h_end = i * self.patch_height, (i + 1) * self.patch_height
-                w_start, w_end = j * self.patch_width, (j + 1) * self.patch_width
-                
-                patch = combined_data[:, :self.input_channels, h_start:h_end, w_start:w_end]
-                patch_flat = patch.flatten(start_dim=1)
-                patches.append(patch_flat)
-        
-        if not patches:
-            patch = combined_data[:, :self.input_channels, :, :].flatten(start_dim=1)
-            if patch.size(1) < self.patch_size:
-                padding = torch.zeros(batch_size, self.patch_size - patch.size(1), device=patch.device, dtype=patch.dtype)
-                patch = torch.cat([patch, padding], dim=1)
-            elif patch.size(1) > self.patch_size:
-                patch = patch[:, :self.patch_size]
-            patches = [patch]
-        
-        patches = torch.stack(patches, dim=1)
-        embeddings = self.projection(patches)
-        
-        num_patches = embeddings.size(1)
-        pos_embed = self.position_embedding[:, :num_patches, :]
-        embeddings = embeddings + pos_embed
-        
-        return embeddings
+        assert height % patch_height == 0, "Height must be divisible by patch_height"
+        assert window % patch_width == 0, "Window must be divisible by patch_width"
 
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int = 256, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        x = (x
+             .unfold(2, patch_height, patch_height) # depth dimention
+             .unfold(3, patch_width, patch_width)) # window dimention
+        x = x.contiguous().view(batch_size, channels, -1, patch_height, patch_width)
+        x = x.permute(0, 2, 1, 3, 4).contiguous() # shape: (batch_size, num_patches, channels, patch_height, patch_width)
+        x = x.view(batch_size, -1, channels * patch_height * patch_width)
         
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-        
-        self.q_linear = nn.Linear(embed_dim, embed_dim)
-        self.k_linear = nn.Linear(embed_dim, embed_dim)
-        self.v_linear = nn.Linear(embed_dim, embed_dim)
-        self.out_linear = nn.Linear(embed_dim, embed_dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.scale = math.sqrt(self.head_dim)
-        
-    def forward(self, x):
-        batch_size, seq_len, embed_dim = x.shape
-        
-        Q = self.q_linear(x)
-        K = self.k_linear(x)
-        V = self.v_linear(x)
-        
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        attention_output = torch.matmul(attention_weights, V)
-        
-        attention_output = attention_output.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, embed_dim
-        )
-        
-        output = self.out_linear(attention_output)
-        
-        return output
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim: int = 256, num_heads: int = 8, ff_dim: int = 1024, dropout: float = 0.1):
-        super().__init__()
-        self.attention = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        
-        self.feed_forward = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, embed_dim),
-            nn.Dropout(dropout)
-        )
-        
-    def forward(self, x):
-        attn_output = self.attention(x)
-        x = self.norm1(x + attn_output)
-        
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + ff_output)
-        
+        x = self.projection(x)  # shape: (batch_size, num_patches, embed_dim)
+        x = x + self.position_embedding[:, :x.size(1)]
         return x
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self,
+                 embed_dim: int = 128,
+                 num_heads: int = 8,
+                 num_layers: int = 8,
+                 dropout: float = 0.1):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim,
+                                                   nhead=num_heads,
+                                                   dropout=dropout,
+                                                   batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+    
+    def forward(self, x):
+        return self.encoder(x)
 
 
 class LOBTransformer(LightningModule):
     def __init__(self,
                  input_channels: int = 2,
-                 patch_height: int = 5,
-                 patch_width: int = 10,
-                 embed_dim: int = 256,
-                 num_heads: int = 8,
-                 num_transformer_layers: int = 6,
-                 ff_dim: int = 1024,
-                 lstm_hidden_dim: int = 128,
+                 patch_size: tuple = (5, 12),
+                 embed_dim: int = 128,
+                 num_heads: int = 4,
+                 num_transformer_layers: int = 8,
+                 lstm_hidden_dim: int = 64,
                  num_classes: int = 3,
                  dropout: float = 0.1,
                  lr: float = 1e-3):
         super().__init__()
         self.save_hyperparameters()
-        
-        self.lr = lr
-        self.num_classes = num_classes
-        
         self.patch_embedding = StructuredPatchEmbedding(
             input_channels=input_channels,
-            patch_height=patch_height,
-            patch_width=patch_width,
+            patch_size=patch_size,
             embed_dim=embed_dim
         )
-        
-        self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, ff_dim, dropout)
-            for _ in range(num_transformer_layers)
-        ])
-        
+        self.transformer = TransformerEncoder(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_transformer_layers,
+            dropout=dropout
+        )
         self.lstm = nn.LSTM(
             input_size=embed_dim,
             hidden_size=lstm_hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout if num_transformer_layers > 1 else 0,
-            bidirectional=True
+            batch_first=True
         )
-        
         self.classifier = nn.Sequential(
-            nn.Linear(lstm_hidden_dim * 2, lstm_hidden_dim),
+            nn.Linear(lstm_hidden_dim, 64),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(lstm_hidden_dim, num_classes)
+            nn.Linear(64, num_classes)
         )
-        
-        self.criterion = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.lr = lr
         
     def forward(self, x):
         embeddings = self.patch_embedding(x)
+        transformer_out = self.transformer(embeddings)
+        _, (h_n, c_n) = self.lstm(transformer_out)
         
-        for transformer_block in self.transformer_blocks:
-            embeddings = transformer_block(embeddings)
-        
-        lstm_output, (hidden, cell) = self.lstm(embeddings)
-        final_output = lstm_output[:, -1, :]
-        logits = self.classifier(final_output)
-        
-        return logits
+        return self.classifier(h_n[-1])
     
     def training_step(self, batch, batch_idx):
         x, y = batch
         
         logits = self(x)
-        loss = self.criterion(logits, y)
-        
-        pred = torch.argmax(logits, dim=1)
-        acc = (pred == y).float().mean()
+        loss = self.loss_fn(logits, y)
         
         self.log('train_loss', loss, prog_bar=True)
-        self.log('train_acc', acc, prog_bar=True)
         
         return loss
     
@@ -294,8 +222,8 @@ class LOBTransformer(LightningModule):
         x, y = batch
         
         logits = self(x)
-        loss = self.criterion(logits, y)
-        
+        loss = self.loss_fn(logits, y)
+
         pred = torch.argmax(logits, dim=1)
         acc = (pred == y).float().mean()
         
@@ -308,7 +236,7 @@ class LOBTransformer(LightningModule):
         x, y = batch
         
         logits = self(x)
-        loss = self.criterion(logits, y)
+        loss = self.loss_fn(logits, y)
         
         pred = torch.argmax(logits, dim=1)
         acc = (pred == y).float().mean()
@@ -347,7 +275,7 @@ class LOBTransformer(LightningModule):
             return results
 
 
-def calculate_target(df, steps_ahead=24, threshold=0.1/100):
+def calculate_target(df, steps_ahead=12, threshold=0.01/100):
     targets = []
     
     for i in range(len(df)):
@@ -388,8 +316,6 @@ if __name__ == '__main__':
     from dotenv import load_dotenv
     load_dotenv()
     
-    from torch.utils.data import DataLoader
-    
     from lightning.pytorch import Trainer
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     
@@ -399,8 +325,17 @@ if __name__ == '__main__':
     
     model_path = 'models'
     max_epochs = 100
-    batch_size = 64
-    window_size = 72
+    batch_size = 32
+    window_size = 60
+    
+    patch_height = 5
+    patch_width = 6
+    embed_dim = 128
+    num_heads = 8
+    num_transformer_layers = 6
+    lstm_hidden_dim = 64
+    dropout = 0.1
+    lr = 1e-4
     
     from supabase import create_client, Client
     from supabase.client import ClientOptions
@@ -424,9 +359,9 @@ if __name__ == '__main__':
     ) for o in range(6)])
     df = df.reset_index()
     
-    df['target'] = calculate_target(df, steps_ahead=24, threshold=0.1/100)
+    df['target'] = calculate_target(df, steps_ahead=12, threshold=0.01/100)
     
-    train_cutoff = int(len(df) * 0.7)
+    train_cutoff = int(len(df) * 0.8)
     val_cutoff = int(len(df) * 0.9)
     
     train_dataset, val_dataset, test_dataset = (
@@ -438,17 +373,19 @@ if __name__ == '__main__':
     print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
     
     train_dataloader, val_dataloader, test_dataloader = (
-        DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True),
-        DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True),
-        DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_dataset.to_dataloader(batch_size=batch_size, shuffle=True),
+        val_dataset.to_dataloader(batch_size=batch_size, shuffle=False),
+        test_dataset.to_dataloader(batch_size=batch_size, shuffle=False)
     )
     
     early_stopping_callback = EarlyStopping(
         monitor='val_loss',
         min_delta=1e-6,
-        patience=3,
-        verbose=False,
-        mode='min'
+        patience=5,  # Increased patience
+        verbose=True,  # Enable verbose for debugging
+        mode='min',
+        strict=True,  # Raise error if metric is not found
+        check_on_train_epoch_end=False  # Check at validation end
     )
     
     checkpoint_callback = ModelCheckpoint(
@@ -471,16 +408,14 @@ if __name__ == '__main__':
     
     lob_transformer = LOBTransformer(
         input_channels=2,
-        patch_height=5,
-        patch_width=10,
-        embed_dim=256,
-        num_heads=8,
-        num_transformer_layers=6,
-        ff_dim=1024,
-        lstm_hidden_dim=128,
+        patch_size=(patch_height, patch_width),
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_transformer_layers=num_transformer_layers,
+        lstm_hidden_dim=lstm_hidden_dim,
         num_classes=3,
-        dropout=0.1,
-        lr=1e-4
+        dropout=dropout,
+        lr=lr
     )
     
     trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
