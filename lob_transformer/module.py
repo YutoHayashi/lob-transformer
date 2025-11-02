@@ -313,6 +313,23 @@ def calculate_target(df, steps_ahead=12, threshold=0.01/100):
     return targets
 
 
+def load_lobtransformer_model(model_path: str) -> LOBTransformer|None:
+    import os
+    
+    print("Loading LOBTransformer model...")
+    checkpoint_files = [f for f in os.listdir(model_path) if f.startswith('lobtransformer-') and f.endswith('.ckpt')]
+    if not checkpoint_files:
+        raise FileNotFoundError("No lobtransformer checkpoint files found in the specified output path.")
+
+    latest_checkpoint = max(checkpoint_files, key=lambda f: os.path.getctime(os.path.join(model_path, f)))
+    checkpoint_path = os.path.join(model_path, latest_checkpoint)
+
+    model = LOBTransformer.load_from_checkpoint(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Loaded model from {checkpoint_path}")
+    
+    return model
+
+
 def main():
     import os
     from dotenv import load_dotenv
