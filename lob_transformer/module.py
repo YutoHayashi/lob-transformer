@@ -313,8 +313,7 @@ def calculate_target(df, steps_ahead=12, threshold=0.01/100):
     return targets
 
 
-if __name__ == '__main__':
-    # Example to use
+def main():
     import os
     from dotenv import load_dotenv
     load_dotenv()
@@ -324,7 +323,7 @@ if __name__ == '__main__':
     
     supabase_url = os.getenv('SUPABASE_URL')
     supabase_key = os.getenv('SUPABASE_KEY')
-    supabase_table = 'bitflyer_fx_btc_jpy_orderbook'
+    supabase_table = os.getenv('SUPABASE_TABLE_FOR_TRAIN_TRANSFORMER')
     
     model_path = 'models'
     max_epochs = 100
@@ -436,3 +435,8 @@ if __name__ == '__main__':
         print(f"  Confidence: {pred['confidence']:.4f}")
         print(f"  Probabilities: {pred['probabilities']}")
         print()
+
+
+if __name__ == '__main__':
+    # Example to use
+    main()
