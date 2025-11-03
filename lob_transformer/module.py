@@ -66,7 +66,7 @@ class LOBDataset(Dataset):
         snapshots = np.stack(snapshots, axis=0) # shape: (num_samples, 2, depth*2)
         
         samples = []
-        for i in range(len(snapshots) - self.window_size + 1):
+        for i in range(len(snapshots) - self.window_size):
             window = snapshots[i:i + self.window_size] # shape: (window_size, 2, depth*2)
             window = np.transpose(window, (1, 2, 0)) # shape: (2, depth*2, window_size)
             samples.append(window)
