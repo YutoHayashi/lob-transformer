@@ -40,7 +40,6 @@ class LOBDataset(Dataset):
         self.data = self._preprocess_data(self.data)
         self.data = self._data_to_tensors(self.data) # shape: (num_samples, 2, depth*2, window_size)
     
-    
     def _validate_data(self, df: pd.DataFrame):
         price_cols = [f'bid_price_{i+1}' for i in range(self.depth)] + [f'ask_price_{i+1}' for i in range(self.depth)]
         size_cols = [f'bid_size_{i+1}' for i in range(self.depth)] + [f'ask_size_{i+1}' for i in range(self.depth)]
@@ -48,7 +47,6 @@ class LOBDataset(Dataset):
         for col in required_columns:
             if col not in df.columns:
                 raise ValueError(f"Missing required column: {col}")
-    
     
     def _preprocess_data(self, df: pd.DataFrame) -> np.array:
         snapshots = []
@@ -75,10 +73,8 @@ class LOBDataset(Dataset):
         
         return np.stack(samples).astype(np.float32) # shape: (num_samples, 2, depth*2, window_size)
     
-    
     def _target_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
         return df
-    
     
     def _apply_zscore_normalization(self, df: pd.DataFrame, window: int = 60) -> pd.DataFrame:
         def rolling_zscore_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -96,21 +92,17 @@ class LOBDataset(Dataset):
         
         return df
     
-    
     def _data_to_tensors(self, arr: np.array, **kwargs) -> torch.Tensor:
         return torch.tensor(arr, **{
             'dtype': torch.float32,
             **kwargs
         })
     
-    
     def to_dataloader(self, num_workers=4, pin_memory=True, **kwargs) -> DataLoader:
         return DataLoader(self, num_workers=num_workers, pin_memory=pin_memory, **kwargs)
     
-    
     def __len__(self):
         return max(0, len(self.data) - self.window_size + 1)
-    
     
     def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.data[idx]
@@ -248,6 +240,14 @@ class LOBTransformer(LightningModule):
         self.log('test_acc', acc)
         
         return loss
+    
+    def predict_step(self, batch, batch_idx):
+        x, _ = batch
+        
+        logits = self(x)
+        probabilities = F.softmax(logits, dim=1)
+
+        return probabilities
     
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.lr)
