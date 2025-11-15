@@ -10,7 +10,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-from lightning.pytorch import LightningModule
+import torchmetrics
+
+from lightning.pytorch import LightningModule, Trainer
 
 
 class LOBDataset(Dataset):
@@ -36,7 +38,7 @@ class LOBDataset(Dataset):
             target_array = target_array.flatten()  # Convert to 1D
         self.target_data = self._data_to_tensors(target_array, dtype=torch.long)  # Use long for classification
         
-        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)])
+        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)], window=self.window_size)
         self.data = self._preprocess_data(self.data)
         self.data = self._data_to_tensors(self.data) # shape: (num_samples, 2, depth*2, window_size)
     
@@ -102,7 +104,7 @@ class LOBDataset(Dataset):
         return DataLoader(self, num_workers=num_workers, pin_memory=pin_memory, **kwargs)
     
     def __len__(self):
-        return max(0, len(self.data) - self.window_size + 1)
+        return len(self.data)
     
     def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.data[idx]
@@ -196,6 +198,10 @@ class LOBTransformer(LightningModule):
         self.loss_fn = nn.CrossEntropyLoss()
         self.lr = lr
         
+        self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.test_f1 = torchmetrics.F1Score(task="multiclass", num_classes=num_classes, average='macro')
+        self.test_recall = torchmetrics.Recall(task="multiclass", num_classes=num_classes, average='macro')
+        
     def forward(self, x):
         embeddings = self.patch_embedding(x)
         transformer_out = self.transformer(embeddings)
@@ -234,11 +240,15 @@ class LOBTransformer(LightningModule):
         loss = self.loss_fn(logits, y)
         
         pred = torch.argmax(logits, dim=1)
-        acc = (pred == y).float().mean()
+        
+        acc = self.test_accuracy(pred, y)
+        f1 = self.test_f1(pred, y)
+        recall = self.test_recall(pred, y)
         
         self.log('test_loss', loss)
         self.log('test_acc', acc)
-        
+        self.log('test_f1', f1)
+        self.log('test_recall', recall)
         return loss
     
     def predict_step(self, batch, batch_idx):
@@ -251,31 +261,6 @@ class LOBTransformer(LightningModule):
     
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.lr)
-    
-    def predict_price_movement(self, x):
-        self.eval()
-        with torch.no_grad():
-            logits = self(x)
-            probabilities = F.softmax(logits, dim=1)
-            predictions = torch.argmax(probabilities, dim=1)
-            
-            movement_labels = ['down', 'stable', 'up']
-            
-            results = []
-            for i in range(len(predictions)):
-                pred_idx = predictions[i].item()
-                confidence = probabilities[i][pred_idx].item()
-                results.append({
-                    'prediction': movement_labels[pred_idx],
-                    'confidence': confidence,
-                    'probabilities': {
-                        'down': probabilities[i][0].item(),
-                        'stable': probabilities[i][1].item(),
-                        'up': probabilities[i][2].item()
-                    }
-                })
-            
-            return results
 
 
 def calculate_target(df, steps_ahead=12, threshold=0.01/100):
@@ -330,72 +315,28 @@ def load_lobtransformer_model(model_path: str) -> LOBTransformer|None:
     return model
 
 
-def main():
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    
-    from lightning.pytorch import Trainer
+def train(train_dataset: Dataset,
+          val_dataset: Dataset,
+          batch_size: int,
+          max_epochs: int,
+          embed_dim: int,
+          num_heads: int,
+          num_transformer_layers: int,
+          lstm_hidden_dim: int,
+          dropout: float,
+          lr: float,
+          model_path: str = 'models'):  
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-    
-    model_path = os.getenv('MODEL_PATH', 'models')
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_KEY')
-    supabase_table = os.getenv('SUPABASE_TABLE_FOR_TRAIN_TRANSFORMER')
-    
-    max_epochs = 100
-    batch_size = 32
-    window_size = 60
     
     patch_height = 5
     patch_width = 6
-    embed_dim = 128
-    num_heads = 8
-    num_transformer_layers = 6
-    lstm_hidden_dim = 64
-    dropout = 0.1
-    lr = 1e-4
     
-    from supabase import create_client, Client
-    from supabase.client import ClientOptions
-    supabase: Client = create_client(
-        supabase_url,
-        supabase_key,
-        options=ClientOptions(
-            postgrest_client_timeout=604800,
-            storage_client_timeout=604800
-        )
-    )
-    
-    limit = 10000
-    df = pd.concat([pd.DataFrame(
-        supabase.table(supabase_table)
-        .select('*')
-        .limit(limit)
-        .offset(limit * o)
-        .execute()
-        .data
-    ) for o in range(6)])
-    df = df.reset_index()
-    
-    df['target'] = calculate_target(df, steps_ahead=12, threshold=0.01/100)
-    
-    train_cutoff = int(len(df) * 0.8)
-    val_cutoff = int(len(df) * 0.9)
-    
-    train_dataset, val_dataset, test_dataset = (
-        LOBDataset(df[lambda x: x.index < train_cutoff], window_size=window_size),
-        LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], window_size=window_size),
-        LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=window_size)
-    )
-    
-    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
-    
-    train_dataloader, val_dataloader, test_dataloader = (
+    train_dataloader, val_dataloader = (
         train_dataset.to_dataloader(batch_size=batch_size, shuffle=True),
         val_dataset.to_dataloader(batch_size=batch_size, shuffle=False),
-        test_dataset.to_dataloader(batch_size=batch_size, shuffle=False)
     )
+    
+    print(f"DataLoader sizes - Train: {len(train_dataloader)}, Val: {len(val_dataloader)}")
     
     early_stopping_callback = EarlyStopping(
         monitor='val_loss',
@@ -438,20 +379,110 @@ def main():
     )
     
     trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+
+
+def eval(test_dataset: Dataset,
+         model_path: str = 'models'):
+    test_dataloader = test_dataset.to_dataloader(batch_size=32, shuffle=False)
     
-    trainer.test(lob_transformer, test_dataloader)
+    lob_transformer = load_lobtransformer_model(model_path)
     
-    sample_batch = next(iter(test_dataloader))
-    sample_x, sample_y = sample_batch
-    predictions = lob_transformer.predict_price_movement(sample_x)
+    trainer = Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1 if torch.cuda.is_available() else "auto",
+        logger=False
+    )
     
-    print("\n=== Prediction Results ===")
-    for i, pred in enumerate(predictions[:3]):
-        print(f"Sample {i+1}:")
-        print(f"  Prediction: {pred['prediction']}")
-        print(f"  Confidence: {pred['confidence']:.4f}")
-        print(f"  Probabilities: {pred['probabilities']}")
-        print()
+    trainer.test(lob_transformer, dataloaders=test_dataloader)
+
+
+def main():
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    import argparse
+    parser = argparse.ArgumentParser(description="LOBTransformer Module")
+    parser.add_argument('--mode', type=str, choices=['train', 'eval'], default='train', help='Mode to run the script: train or eval')
+    parser.add_argument('--num_of_samples', type=int, required=False, default=60000, help='Number of samples to fetch from the database')
+    parser.add_argument('--batch_size', type=int, required=False, default=32, help='Batch size for DataLoader')
+    parser.add_argument('--window_size', type=int, required=False, default=120, help='Window size for LOBDataset')
+    parser.add_argument('--max_epochs', type=int, required=False, default=100, help='Maximum number of training epochs')
+    parser.add_argument('--embed_dim', type=int, required=False, default=128, help='Embedding dimension for the model')
+    parser.add_argument('--num_heads', type=int, required=False, default=8, help='Number of attention heads')
+    parser.add_argument('--num_transformer_layers', type=int, required=False, default=6, help='Number of transformer layers')
+    parser.add_argument('--lstm_hidden_dim', type=int, required=False, default=64, help='Hidden dimension for LSTM layer')
+    parser.add_argument('--dropout', type=float, required=False, default=0.1, help='Dropout rate for the model')
+    parser.add_argument('--lr', type=float, required=False, default=1e-5, help='Learning rate for the model')
+    
+    args = parser.parse_args()
+    
+    from supabase import create_client, Client
+    from supabase.client import ClientOptions
+    
+    model_path = os.getenv('MODEL_PATH', 'models')
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_KEY')
+    supabase_table = os.getenv('SUPABASE_TABLE_FOR_TRAIN_TRANSFORMER')
+    
+    supabase: Client = create_client(
+        supabase_url,
+        supabase_key,
+        options=ClientOptions(
+            postgrest_client_timeout=604800,
+            storage_client_timeout=604800
+        )
+    )
+    
+    limit = 10000
+    df = pd.concat([pd.DataFrame(
+        supabase.table(supabase_table)
+        .select('*')
+        .limit(limit)
+        .offset(limit * o)
+        .execute()
+        .data
+    ) for o in range(args.num_of_samples // limit)])
+    df = df.reset_index()
+    
+    df['target'] = calculate_target(df, steps_ahead=60, threshold=0.1/100)
+    print(f"Target distribution:\n{df['target'].value_counts(normalize=True)}")
+    
+    train_cutoff = int(len(df) * 0.8)
+    val_cutoff = int(len(df) * 0.9)
+    
+    if args.mode == 'train':
+        train_dataset, val_dataset, test_dataset = (
+            LOBDataset(df[lambda x: x.index < train_cutoff], window_size=args.window_size),
+            LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], window_size=args.window_size),
+            LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.window_size)
+        )
+        
+        train(
+            train_dataset,
+            val_dataset,
+            batch_size=args.batch_size,
+            max_epochs=args.max_epochs,
+            embed_dim=args.embed_dim,
+            num_heads=args.num_heads,
+            num_transformer_layers=args.num_transformer_layers,
+            lstm_hidden_dim=args.lstm_hidden_dim,
+            dropout=args.dropout,
+            lr=args.lr,
+            model_path=model_path
+        )
+        eval(
+            test_dataset,
+            model_path=model_path
+        )
+    elif args.mode == 'eval':
+        # test_dataset = LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.window_size)
+        test_dataset = LOBDataset(df, window_size=args.window_size)
+        
+        eval(
+            test_dataset,
+            model_path=model_path
+        )
 
 
 if __name__ == '__main__':
