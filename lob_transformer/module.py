@@ -31,7 +31,7 @@ class LOBDataset(Dataset):
         self._validate_data(self.data)
         
         self.target_data = self._target_normalization(self.data[target_cols])
-        target_array = self.target_data[:-min(len(self.target_data), self.window_size)].to_numpy()
+        target_array = self.target_data[:-(self.window_size - 1)].to_numpy()
         
         # For classification, ensure target is 1D and convert to long tensor
         if len(target_cols) == 1:
@@ -68,7 +68,7 @@ class LOBDataset(Dataset):
         snapshots = np.stack(snapshots, axis=0) # shape: (num_samples, 2, depth*2)
         
         samples = []
-        for i in range(len(snapshots) - self.window_size):
+        for i in range(len(snapshots) - self.window_size + 1):
             window = snapshots[i:i + self.window_size] # shape: (window_size, 2, depth*2)
             window = np.transpose(window, (1, 2, 0)) # shape: (2, depth*2, window_size)
             samples.append(window)
