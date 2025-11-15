@@ -325,7 +325,8 @@ def train(train_dataset: Dataset,
           lstm_hidden_dim: int,
           dropout: float,
           lr: float,
-          model_path: str = 'models'):  
+          model_path: str = 'models',
+          ckpt_path: str = None):
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     
     patch_height = 5
@@ -378,7 +379,7 @@ def train(train_dataset: Dataset,
         lr=lr
     )
     
-    trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+    trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=ckpt_path)
 
 
 def eval(test_dataset: Dataset,
@@ -414,6 +415,7 @@ def main():
     parser.add_argument('--lstm_hidden_dim', type=int, required=False, default=64, help='Hidden dimension for LSTM layer')
     parser.add_argument('--dropout', type=float, required=False, default=0.1, help='Dropout rate for the model')
     parser.add_argument('--lr', type=float, required=False, default=1e-5, help='Learning rate for the model')
+    parser.add_argument('--ckpt_path', type=str, required=False, default=None, help='Path to save/load model checkpoints')
     
     args = parser.parse_args()
     
@@ -469,7 +471,8 @@ def main():
             lstm_hidden_dim=args.lstm_hidden_dim,
             dropout=args.dropout,
             lr=args.lr,
-            model_path=model_path
+            model_path=model_path,
+            ckpt_path=args.ckpt_path
         )
         eval(
             test_dataset,
