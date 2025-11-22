@@ -18,9 +18,9 @@ from lightning.pytorch import LightningModule, Trainer
 class LOBDataset(Dataset):
     def __init__(self,
                  df: pd.DataFrame,
-                 window_size: int = 100,
-                 target_cols: list = ['target'],
-                 depth: int = 10):
+                 window_size: int,
+                 target_cols: list,
+                 depth: int):
         super().__init__()
         
         self.data = df.copy()
@@ -115,9 +115,9 @@ class LOBDataset(Dataset):
 
 class StructuredPatchEmbedding(nn.Module):
     def __init__(self, 
-                 input_channels: int = 2,
-                 patch_size: tuple = (5, 12),
-                 embed_dim: int = 128):
+                 input_channels: int,
+                 patch_size: tuple,
+                 embed_dim: int):
         super().__init__()
         self.input_channels = input_channels
         self.patch_size = patch_size
@@ -146,10 +146,10 @@ class StructuredPatchEmbedding(nn.Module):
 
 class TransformerEncoder(nn.Module):
     def __init__(self,
-                 embed_dim: int = 128,
-                 num_heads: int = 8,
-                 num_layers: int = 8,
-                 dropout: float = 0.1):
+                 embed_dim: int,
+                 num_heads: int,
+                 num_layers: int,
+                 dropout: float):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim,
                                                    nhead=num_heads,
@@ -163,15 +163,15 @@ class TransformerEncoder(nn.Module):
 
 class LOBTransformer(LightningModule):
     def __init__(self,
-                 input_channels: int = 2,
-                 patch_size: tuple = (5, 12),
-                 embed_dim: int = 128,
-                 num_heads: int = 4,
-                 num_transformer_layers: int = 8,
-                 lstm_hidden_dim: int = 64,
-                 num_classes: int = 3,
-                 dropout: float = 0.1,
-                 lr: float = 1e-3):
+                 input_channels: int,
+                 patch_size: tuple,
+                 embed_dim: int,
+                 num_heads: int,
+                 num_transformer_layers: int,
+                 lstm_hidden_dim: int,
+                 num_classes: int,
+                 dropout: float,
+                 lr: float):
         super().__init__()
         self.save_hyperparameters()
         self.patch_embedding = StructuredPatchEmbedding(
@@ -315,22 +315,23 @@ def load_lobtransformer_model(model_path: str) -> LOBTransformer|None:
     return model
 
 
-def train(train_dataset: Dataset,
-          val_dataset: Dataset,
+def train(train_dataset: LOBDataset,
+          val_dataset: LOBDataset,
           batch_size: int,
           max_epochs: int,
+          patch_height: int,
+          patch_width: int,
           embed_dim: int,
           num_heads: int,
           num_transformer_layers: int,
           lstm_hidden_dim: int,
+          input_channels: int,
           dropout: float,
           lr: float,
+          num_classes: int,
           model_path: str = 'models',
           ckpt_path: str = None):
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-    
-    patch_height = 5
-    patch_width = 6
     
     train_dataloader, val_dataloader = (
         train_dataset.to_dataloader(batch_size=batch_size, shuffle=True),
@@ -368,13 +369,13 @@ def train(train_dataset: Dataset,
     )
     
     lob_transformer = LOBTransformer(
-        input_channels=2,
+        input_channels=input_channels,
         patch_size=(patch_height, patch_width),
         embed_dim=embed_dim,
         num_heads=num_heads,
         num_transformer_layers=num_transformer_layers,
         lstm_hidden_dim=lstm_hidden_dim,
-        num_classes=3,
+        num_classes=num_classes,
         dropout=dropout,
         lr=lr
     )
@@ -382,8 +383,8 @@ def train(train_dataset: Dataset,
     trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=ckpt_path)
 
 
-def eval(test_dataset: Dataset,
-         model_path: str = 'models'):
+def eval(test_dataset: LOBDataset,
+         model_path: str):
     test_dataloader = test_dataset.to_dataloader(batch_size=32, shuffle=False)
     
     lob_transformer = load_lobtransformer_model(model_path)
@@ -399,88 +400,84 @@ def eval(test_dataset: Dataset,
 
 def main():
     import os
+    import json
     from dotenv import load_dotenv
     load_dotenv()
     
     import argparse
     parser = argparse.ArgumentParser(description="LOBTransformer Module")
+    
     parser.add_argument('--mode', type=str, choices=['train', 'eval'], default='train', help='Mode to run the script: train or eval')
-    parser.add_argument('--num_of_samples', type=int, required=False, default=60000, help='Number of samples to fetch from the database')
-    parser.add_argument('--batch_size', type=int, required=False, default=32, help='Batch size for DataLoader')
-    parser.add_argument('--window_size', type=int, required=False, default=120, help='Window size for LOBDataset')
-    parser.add_argument('--max_epochs', type=int, required=False, default=100, help='Maximum number of training epochs')
-    parser.add_argument('--embed_dim', type=int, required=False, default=128, help='Embedding dimension for the model')
-    parser.add_argument('--num_heads', type=int, required=False, default=8, help='Number of attention heads')
-    parser.add_argument('--num_transformer_layers', type=int, required=False, default=6, help='Number of transformer layers')
-    parser.add_argument('--lstm_hidden_dim', type=int, required=False, default=64, help='Hidden dimension for LSTM layer')
-    parser.add_argument('--dropout', type=float, required=False, default=0.1, help='Dropout rate for the model')
-    parser.add_argument('--lr', type=float, required=False, default=1e-5, help='Learning rate for the model')
+    parser.add_argument('--preset', type=str, required=False, default='debug', help='Preset configuration to use')
+    
+    parser.add_argument('--csv_path', type=str, required=False, default=None, help='Path to the CSV data file')
+    parser.add_argument('--horizon', type=int, required=False, default=None, help='Prediction horizon in number of events')
+    parser.add_argument('--threshold', type=float, required=False, default=None, help='Threshold for target calculation')
+    parser.add_argument('--batch_size', type=int, required=False, default=None, help='Batch size for DataLoader')
+    parser.add_argument('--window_size', type=int, required=False, default=None, help='Window size for LOBDataset')
+    parser.add_argument('--max_epochs', type=int, required=False, default=None, help='Maximum number of training epochs')
+    parser.add_argument('--patch_height', type=int, required=False, default=None, help='Patch height for StructuredPatchEmbedding')
+    parser.add_argument('--patch_width', type=int, required=False, default=None, help='Patch width for StructuredPatchEmbedding')
+    parser.add_argument('--embed_dim', type=int, required=False, default=None, help='Embedding dimension for the model')
+    parser.add_argument('--num_heads', type=int, required=False, default=None, help='Number of attention heads')
+    parser.add_argument('--num_transformer_layers', type=int, required=False, default=None, help='Number of transformer layers')
+    parser.add_argument('--lstm_hidden_dim', type=int, required=False, default=None, help='Hidden dimension for LSTM layer')
+    parser.add_argument('--input_channels', type=int, required=False, default=None, help='Number of input channels for the model')
+    parser.add_argument('--dropout', type=float, required=False, default=None, help='Dropout rate for the model')
+    parser.add_argument('--lr', type=float, required=False, default=None, help='Learning rate for the model')
+    
     parser.add_argument('--ckpt_path', type=str, required=False, default=None, help='Path to save/load model checkpoints')
     
     args = parser.parse_args()
     
-    from supabase import create_client, Client
-    from supabase.client import ClientOptions
+    with open(os.path.join(os.path.dirname(__file__), 'presets.json'), 'r') as f:
+        preset = json.load(f).get(args.preset, {})
+    
+    args = {k: v for k, v in vars(args).items() if v is not None} | preset
     
     model_path = os.getenv('MODEL_PATH', 'models')
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_KEY')
-    supabase_table = os.getenv('SUPABASE_TABLE_FOR_TRAIN_TRANSFORMER')
     
-    supabase: Client = create_client(
-        supabase_url,
-        supabase_key,
-        options=ClientOptions(
-            postgrest_client_timeout=604800,
-            storage_client_timeout=604800
-        )
-    )
+    df = pd.read_csv(args.get('csv_path')).reset_index()
     
-    limit = 10000
-    df = pd.concat([pd.DataFrame(
-        supabase.table(supabase_table)
-        .select('*')
-        .limit(limit)
-        .offset(limit * o)
-        .execute()
-        .data
-    ) for o in range(args.num_of_samples // limit)])
-    df = df.reset_index()
-    
-    df['target'] = calculate_target(df, steps_ahead=60, threshold=0.1/100)
-    print(f"Target distribution:\n{df['target'].value_counts(normalize=True)}")
+    target_col = 'target'
+    df[target_col] = calculate_target(df, steps_ahead=args.get('horizon'), threshold=args.get('threshold'))
+    num_classes = df[target_col].nunique()
+    print(f"Target distribution:\n{df[target_col].value_counts(normalize=True)}")
     
     train_cutoff = int(len(df) * 0.8)
     val_cutoff = int(len(df) * 0.9)
     
-    if args.mode == 'train':
+    if args.get('mode') == 'train':
         train_dataset, val_dataset, test_dataset = (
-            LOBDataset(df[lambda x: x.index < train_cutoff], window_size=args.window_size),
-            LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], window_size=args.window_size),
-            LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.window_size)
+            LOBDataset(df[lambda x: x.index < train_cutoff], window_size=args.get('window_size'), target_cols=[target_col], depth=10),
+            LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], window_size=args.get('window_size'), target_cols=[target_col], depth=10),
+            LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.get('window_size'), target_cols=[target_col], depth=10)
         )
         
         train(
             train_dataset,
             val_dataset,
-            batch_size=args.batch_size,
-            max_epochs=args.max_epochs,
-            embed_dim=args.embed_dim,
-            num_heads=args.num_heads,
-            num_transformer_layers=args.num_transformer_layers,
-            lstm_hidden_dim=args.lstm_hidden_dim,
-            dropout=args.dropout,
-            lr=args.lr,
+            batch_size=args.get('batch_size'),
+            max_epochs=args.get('max_epochs'),
+            patch_height=args.get('patch_height'),
+            patch_width=args.get('patch_width'),
+            embed_dim=args.get('embed_dim'),
+            num_heads=args.get('num_heads'),
+            num_transformer_layers=args.get('num_transformer_layers'),
+            lstm_hidden_dim=args.get('lstm_hidden_dim'),
+            input_channels=args.get('input_channels'),
+            dropout=args.get('dropout'),
+            lr=args.get('lr'),
+            num_classes=num_classes,
             model_path=model_path,
-            ckpt_path=args.ckpt_path
+            ckpt_path=args.get('ckpt_path')
         )
         eval(
             test_dataset,
             model_path=model_path
         )
-    elif args.mode == 'eval':
-        # test_dataset = LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.window_size)
-        test_dataset = LOBDataset(df, window_size=args.window_size)
+    elif args.get('mode') == 'eval':
+        test_dataset = LOBDataset(df, window_size=args.get('window_size'), target_cols=[target_col], depth=10)
         
         eval(
             test_dataset,

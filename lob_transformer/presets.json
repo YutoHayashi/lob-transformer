@@ -1,0 +1,19 @@
+{
+    "debug": {
+        "csv_path": "csv/debug_data.csv",
+        "horizon": 12,
+        "threshold": 1e-4,
+        "batch_size": 8,
+        "window_size": 60,
+        "max_epochs": 1,
+        "patch_height": 20,
+        "patch_width": 60,
+        "embed_dim": 128,
+        "num_heads": 4,
+        "num_transformer_layers": 2,
+        "lstm_hidden_dim": 64,
+        "input_channels": 2,
+        "dropout": 0.1,
+        "lr": 1e-4
+    }
+}
