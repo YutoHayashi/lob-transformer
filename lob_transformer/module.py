@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -15,37 +16,52 @@ import torchmetrics
 from lightning.pytorch import LightningModule, Trainer
 
 
+@dataclass
+class LOBDatasetConfig:
+    window_size: int
+    horizon: int
+    threshold: float
+    target_cols: list[str]
+    depth: int
+
+
 class LOBDataset(Dataset):
     def __init__(self,
                  df: pd.DataFrame,
                  window_size: int,
+                 horizon: int,
+                 threshold: float,
                  target_cols: list,
                  depth: int):
         super().__init__()
         
         self.data = df.copy()
-        self.window_size = window_size
-        self.target_cols = target_cols
-        self.depth = depth
+        self.config = LOBDatasetConfig(
+            window_size=window_size,
+            horizon=horizon,
+            threshold=threshold,
+            target_cols=target_cols,
+            depth=depth
+        )
         
         self._validate_data(self.data)
         
         self.target_data = self._target_normalization(self.data[target_cols])
-        target_array = self.target_data[:-(self.window_size - 1)].to_numpy()
+        target_array = self.target_data[:-(window_size - 1)].to_numpy()
         
         # For classification, ensure target is 1D and convert to long tensor
         if len(target_cols) == 1:
             target_array = target_array.flatten()  # Convert to 1D
         self.target_data = self._data_to_tensors(target_array, dtype=torch.long)  # Use long for classification
         
-        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)], window=self.window_size)
+        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)], window=window_size)
         self.data = self._preprocess_data(self.data)
         self.data = self._data_to_tensors(self.data) # shape: (num_samples, 2, depth*2, window_size)
     
     def _validate_data(self, df: pd.DataFrame):
-        price_cols = [f'bid_price_{i+1}' for i in range(self.depth)] + [f'ask_price_{i+1}' for i in range(self.depth)]
-        size_cols = [f'bid_size_{i+1}' for i in range(self.depth)] + [f'ask_size_{i+1}' for i in range(self.depth)]
-        required_columns = self.target_cols + price_cols + size_cols
+        price_cols = [f'bid_price_{i+1}' for i in range(self.config.depth)] + [f'ask_price_{i+1}' for i in range(self.config.depth)]
+        size_cols = [f'bid_size_{i+1}' for i in range(self.config.depth)] + [f'ask_size_{i+1}' for i in range(self.config.depth)]
+        required_columns = self.config.target_cols + price_cols + size_cols
         for col in required_columns:
             if col not in df.columns:
                 raise ValueError(f"Missing required column: {col}")
@@ -54,12 +70,12 @@ class LOBDataset(Dataset):
         snapshots = []
         for i in range(len(df)):
             bids = np.stack([
-                df.iloc[i][[f'bid_price_{j+1}' for j in range(self.depth)]].to_numpy(),
-                df.iloc[i][[f'bid_size_{j+1}' for j in range(self.depth)]].to_numpy(),
+                df.iloc[i][[f'bid_price_{j+1}' for j in range(self.config.depth)]].to_numpy(),
+                df.iloc[i][[f'bid_size_{j+1}' for j in range(self.config.depth)]].to_numpy(),
             ], axis=0) # shape: (2, depth)
             asks = np.stack([
-                df.iloc[i][[f'ask_price_{j+1}' for j in range(self.depth)]].to_numpy(),
-                df.iloc[i][[f'ask_size_{j+1}' for j in range(self.depth)]].to_numpy(),
+                df.iloc[i][[f'ask_price_{j+1}' for j in range(self.config.depth)]].to_numpy(),
+                df.iloc[i][[f'ask_size_{j+1}' for j in range(self.config.depth)]].to_numpy(),
             ], axis=0) # shape: (2, depth)
             
             snapshot = np.concatenate([bids, asks], axis=1) # shape: (2, depth*2)
@@ -68,8 +84,8 @@ class LOBDataset(Dataset):
         snapshots = np.stack(snapshots, axis=0) # shape: (num_samples, 2, depth*2)
         
         samples = []
-        for i in range(len(snapshots) - self.window_size + 1):
-            window = snapshots[i:i + self.window_size] # shape: (window_size, 2, depth*2)
+        for i in range(len(snapshots) - self.config.window_size + 1):
+            window = snapshots[i:i + self.config.window_size] # shape: (window_size, 2, depth*2)
             window = np.transpose(window, (1, 2, 0)) # shape: (2, depth*2, window_size)
             samples.append(window)
         
@@ -86,8 +102,8 @@ class LOBDataset(Dataset):
             zscore = zscore.fillna(0.0)
             return zscore.astype(np.float32)
         
-        price_cols = [f'bid_price_{i+1}' for i in range(self.depth)] + [f'ask_price_{i+1}' for i in range(self.depth)]
-        size_cols = [f'bid_size_{i+1}' for i in range(self.depth)] + [f'ask_size_{i+1}' for i in range(self.depth)]
+        price_cols = [f'bid_price_{i+1}' for i in range(self.config.depth)] + [f'ask_price_{i+1}' for i in range(self.config.depth)]
+        size_cols = [f'bid_size_{i+1}' for i in range(self.config.depth)] + [f'ask_size_{i+1}' for i in range(self.config.depth)]
         
         df[price_cols] = rolling_zscore_dataframe(df[price_cols])
         df[size_cols] = rolling_zscore_dataframe(df[size_cols])
@@ -171,7 +187,8 @@ class LOBTransformer(LightningModule):
                  lstm_hidden_dim: int,
                  num_classes: int,
                  dropout: float,
-                 lr: float):
+                 lr: float,
+                 dataset_config: LOBDatasetConfig = field(default_factory=LOBDatasetConfig)):
         super().__init__()
         self.save_hyperparameters()
         self.patch_embedding = StructuredPatchEmbedding(
@@ -201,7 +218,11 @@ class LOBTransformer(LightningModule):
         self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
         self.test_f1 = torchmetrics.F1Score(task="multiclass", num_classes=num_classes, average='macro')
         self.test_recall = torchmetrics.Recall(task="multiclass", num_classes=num_classes, average='macro')
-        
+    
+    @classmethod
+    def from_dataset(cls, dataset: LOBDataset, **kwargs):
+        return cls(dataset_config=dataset.config, **kwargs)
+    
     def forward(self, x):
         embeddings = self.patch_embedding(x)
         transformer_out = self.transformer(embeddings)
@@ -298,23 +319,6 @@ def calculate_target(df, steps_ahead=12, threshold=0.01/100):
     return targets
 
 
-def load_lobtransformer_model(model_path: str) -> LOBTransformer|None:
-    import os
-    
-    print("Loading LOBTransformer model...")
-    checkpoint_files = [f for f in os.listdir(model_path) if f.startswith('lobtransformer-') and f.endswith('.ckpt')]
-    if not checkpoint_files:
-        raise FileNotFoundError("No lobtransformer checkpoint files found in the specified output path.")
-
-    latest_checkpoint = max(checkpoint_files, key=lambda f: os.path.getctime(os.path.join(model_path, f)))
-    checkpoint_path = os.path.join(model_path, latest_checkpoint)
-
-    model = LOBTransformer.load_from_checkpoint(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loaded model from {checkpoint_path}")
-    
-    return model
-
-
 def train(train_dataset: LOBDataset,
           val_dataset: LOBDataset,
           batch_size: int,
@@ -337,6 +341,7 @@ def train(train_dataset: LOBDataset,
         train_dataset.to_dataloader(batch_size=batch_size, shuffle=True),
         val_dataset.to_dataloader(batch_size=batch_size, shuffle=False),
     )
+    dataset_config = train_dataset.config
     
     print(f"DataLoader sizes - Train: {len(train_dataloader)}, Val: {len(val_dataloader)}")
     
@@ -352,7 +357,7 @@ def train(train_dataset: LOBDataset,
     
     checkpoint_callback = ModelCheckpoint(
         dirpath=model_path,
-        filename="lobtransformer-{epoch:02d}-{val_loss:.4f}",
+        filename=f'lobtransformer-h={dataset_config.horizon}-pt={dataset_config.threshold}-w={dataset_config.window_size}-bs={batch_size}-ph={patch_height}-pw={patch_width}-ed={embed_dim}-heads={num_heads}-tlayers={num_transformer_layers}-lstm={lstm_hidden_dim}-dropout={dropout}-lr={lr}' + "{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         save_top_k=1,
         mode="min",
@@ -368,7 +373,8 @@ def train(train_dataset: LOBDataset,
         logger=False
     )
     
-    lob_transformer = LOBTransformer(
+    lob_transformer = LOBTransformer.from_dataset(
+        train_dataset,
         input_channels=input_channels,
         patch_size=(patch_height, patch_width),
         embed_dim=embed_dim,
@@ -381,13 +387,18 @@ def train(train_dataset: LOBDataset,
     )
     
     trainer.fit(lob_transformer, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=ckpt_path)
+    
+    return (
+        lob_transformer,
+        early_stopping_callback,
+        checkpoint_callback
+    )
 
 
 def eval(test_dataset: LOBDataset,
-         model_path: str):
+         ckpt_path: str):
     test_dataloader = test_dataset.to_dataloader(batch_size=32, shuffle=False)
-    
-    lob_transformer = load_lobtransformer_model(model_path)
+    lob_transformer = LOBTransformer.load_from_checkpoint(ckpt_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
     
     trainer = Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -395,14 +406,16 @@ def eval(test_dataset: LOBDataset,
         logger=False
     )
     
-    trainer.test(lob_transformer, dataloaders=test_dataloader)
+    return trainer.test(lob_transformer, dataloaders=test_dataloader)
 
 
 def main():
     import os
     import json
+    
     from dotenv import load_dotenv
     load_dotenv()
+    model_path = os.getenv('MODEL_PATH', 'models')
     
     import argparse
     parser = argparse.ArgumentParser(description="LOBTransformer Module")
@@ -435,8 +448,6 @@ def main():
     
     args = {k: v for k, v in vars(args).items() if v is not None} | preset
     
-    model_path = os.getenv('MODEL_PATH', 'models')
-    
     df = pd.read_csv(args.get('csv_path')).reset_index()
     
     target_col = 'target'
@@ -448,13 +459,18 @@ def main():
     val_cutoff = int(len(df) * 0.9)
     
     if args.get('mode') == 'train':
-        train_dataset, val_dataset, test_dataset = (
-            LOBDataset(df[lambda x: x.index < train_cutoff], window_size=args.get('window_size'), target_cols=[target_col], depth=10),
-            LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], window_size=args.get('window_size'), target_cols=[target_col], depth=10),
-            LOBDataset(df[lambda x: x.index >= val_cutoff], window_size=args.get('window_size'), target_cols=[target_col], depth=10)
+        train_dataset = LOBDataset(
+            df[lambda x: x.index < train_cutoff],
+            window_size=args.get('window_size'),
+            horizon=args.get('horizon'),
+            threshold=args.get('threshold'),
+            target_cols=[target_col],
+            depth=10
         )
+        val_dataset = LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], **train_dataset.config.__dict__)
+        test_dataset = LOBDataset(df[lambda x: x.index >= val_cutoff], **train_dataset.config.__dict__)
         
-        train(
+        lob_transformer, early_stopping_callback, checkpoint_callback = train(
             train_dataset,
             val_dataset,
             batch_size=args.get('batch_size'),
@@ -472,16 +488,24 @@ def main():
             model_path=model_path,
             ckpt_path=args.get('ckpt_path')
         )
-        eval(
-            test_dataset,
-            model_path=model_path
-        )
-    elif args.get('mode') == 'eval':
-        test_dataset = LOBDataset(df, window_size=args.get('window_size'), target_cols=[target_col], depth=10)
         
         eval(
             test_dataset,
-            model_path=model_path
+            ckpt_path=checkpoint_callback.best_model_path
+        )
+    elif args.get('mode') == 'eval':
+        test_dataset = LOBDataset(
+            df,
+            window_size=args.get('window_size'),
+            horizon=args.get('horizon'),
+            threshold=args.get('threshold'),
+            target_cols=[target_col],
+            depth=10
+        )
+        
+        eval(
+            test_dataset,
+            ckpt_path=args.get('ckpt_path')
         )
 
 
