@@ -28,33 +28,23 @@ class LOBDatasetConfig:
 class LOBDataset(Dataset):
     def __init__(self,
                  df: pd.DataFrame,
-                 window_size: int,
-                 horizon: int,
-                 threshold: float,
-                 target_cols: list,
-                 depth: int):
+                 config: LOBDatasetConfig):
         super().__init__()
         
         self.data = df.copy()
-        self.config = LOBDatasetConfig(
-            window_size=window_size,
-            horizon=horizon,
-            threshold=threshold,
-            target_cols=target_cols,
-            depth=depth
-        )
+        self.config = config
         
         self._validate_data(self.data)
         
-        self.target_data = self._target_normalization(self.data[target_cols])
-        target_array = self.target_data[:-(window_size - 1)].to_numpy()
+        self.target_data = self._target_normalization(self.data[config.target_cols])
+        target_array = self.target_data[:-(config.window_size - 1)].to_numpy()
         
         # For classification, ensure target is 1D and convert to long tensor
-        if len(target_cols) == 1:
+        if len(config.target_cols) == 1:
             target_array = target_array.flatten()  # Convert to 1D
         self.target_data = self._data_to_tensors(target_array, dtype=torch.long)  # Use long for classification
         
-        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(target_cols)], window=window_size)
+        self.data = self._apply_zscore_normalization(self.data[self.data.columns.difference(config.target_cols)], window=config.window_size)
         self.data = self._preprocess_data(self.data)
         self.data = self._data_to_tensors(self.data) # shape: (num_samples, 2, depth*2, window_size)
     
@@ -94,7 +84,7 @@ class LOBDataset(Dataset):
     def _target_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
         return df
     
-    def _apply_zscore_normalization(self, df: pd.DataFrame, window: int = 60) -> pd.DataFrame:
+    def _apply_zscore_normalization(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         def rolling_zscore_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             mean = df.rolling(window=window, min_periods=1).mean()
             std = df.rolling(window=window, min_periods=1).std()
@@ -262,14 +252,15 @@ class LOBTransformer(LightningModule):
         
         pred = torch.argmax(logits, dim=1)
         
-        acc = self.test_accuracy(pred, y)
-        f1 = self.test_f1(pred, y)
-        recall = self.test_recall(pred, y)
+        self.test_accuracy(pred, y)
+        self.test_f1(pred, y)
+        self.test_recall(pred, y)
         
         self.log('test_loss', loss)
-        self.log('test_acc', acc)
-        self.log('test_f1', f1)
-        self.log('test_recall', recall)
+        self.log('test_acc', self.test_accuracy, on_step=False, on_epoch=True)
+        self.log('test_f1', self.test_f1, on_step=False, on_epoch=True)
+        self.log('test_recall', self.test_recall, on_step=False, on_epoch=True)
+        
         return loss
     
     def predict_step(self, batch, batch_idx):
@@ -455,20 +446,21 @@ def main():
     num_classes = df[target_col].nunique()
     print(f"Target distribution:\n{df[target_col].value_counts(normalize=True)}")
     
+    lob_dataset_config = LOBDatasetConfig(
+        window_size=args.get('window_size'),
+        horizon=args.get('horizon'),
+        threshold=args.get('threshold'),
+        target_cols=[target_col],
+        depth=10
+    )
+    
     train_cutoff = int(len(df) * 0.8)
     val_cutoff = int(len(df) * 0.9)
     
     if args.get('mode') == 'train':
-        train_dataset = LOBDataset(
-            df[lambda x: x.index < train_cutoff],
-            window_size=args.get('window_size'),
-            horizon=args.get('horizon'),
-            threshold=args.get('threshold'),
-            target_cols=[target_col],
-            depth=10
-        )
-        val_dataset = LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], **train_dataset.config.__dict__)
-        test_dataset = LOBDataset(df[lambda x: x.index >= val_cutoff], **train_dataset.config.__dict__)
+        train_dataset = LOBDataset(df[lambda x: x.index < train_cutoff], config=lob_dataset_config)
+        val_dataset = LOBDataset(df[lambda x: (x.index >= train_cutoff) & (x.index < val_cutoff)], config=lob_dataset_config)
+        test_dataset = LOBDataset(df[lambda x: x.index >= val_cutoff], config=lob_dataset_config)
         
         lob_transformer, early_stopping_callback, checkpoint_callback = train(
             train_dataset,
@@ -494,14 +486,7 @@ def main():
             ckpt_path=checkpoint_callback.best_model_path
         )
     elif args.get('mode') == 'eval':
-        test_dataset = LOBDataset(
-            df,
-            window_size=args.get('window_size'),
-            horizon=args.get('horizon'),
-            threshold=args.get('threshold'),
-            target_cols=[target_col],
-            depth=10
-        )
+        test_dataset = LOBDataset(df, config=lob_dataset_config)
         
         eval(
             test_dataset,
